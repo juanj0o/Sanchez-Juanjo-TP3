@@ -1,6 +1,11 @@
 import numpy as np
 import pandas as pd
 import cupy as cp
+import time
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 class MLP:
     def __init__(self, n_layers, layer_sizes, batch_size, init='random', optimizer='sgd'):
@@ -181,17 +186,17 @@ class MLP:
           lambda_reg=0, early_stopping_patience=None,
           beta1=0.9, beta2=0.999, verbose=True, use_gpu_cache=False):
 
+        start_time = time.time()
+
         history = {
             'train_loss': [],
             'val_loss': [] if X_val is not None else None,
             'learning_rates': []
         }
 
-        # Inicializar Adam si es necesario
         if self.optimizer == 'adam':
             self.initialize_adam()
 
-        # Inicializar early stopping si es necesario
         early_stopper = None
         if early_stopping_patience is not None and X_val is not None:
             early_stopper = EarlyStopping(patience=early_stopping_patience)
@@ -218,13 +223,11 @@ class MLP:
                     print(f"   ❌ Error al cachear en GPU: {e}")
                     print("   → Continuando con transferencias por batch...\n")
 
-        # Guardar el mejor modelo para early stopping
         best_weights = None
         best_biases = None
         best_val_loss = float('inf')
 
         for epoch in range(epochs):
-            # Calcular learning rate actual
             current_lr = learning_rate
 
             if lr_schedule == 'linear' and lr_schedule_params:
@@ -243,12 +246,10 @@ class MLP:
 
             history['learning_rates'].append(float(current_lr))
 
-            # Crear mini-batches
             mini_batches = self.create_mini_batches(X_train, y_train)
 
             epoch_loss = 0
 
-            # Entrenar en cada mini-batch
             for mini_batch_X, mini_batch_y in mini_batches:
                 if is_numpy:
                     mini_batch_X_gpu = cp.asarray(mini_batch_X)
@@ -256,29 +257,23 @@ class MLP:
                 else:
                     mini_batch_X_gpu = mini_batch_X
                     mini_batch_y_gpu = mini_batch_y
-                # Forward pass
                 output = self.forward(mini_batch_X_gpu)
 
-                # Calcular loss con regularización L2
                 batch_loss = self.compute_loss(mini_batch_y_gpu, output, lambda_reg)
                 epoch_loss += batch_loss
 
-                # Backward pass
                 dW, db = self.backpropagation(mini_batch_X_gpu, mini_batch_y_gpu, lambda_reg)
 
-                # Update parameters
                 if self.optimizer == 'adam':
                     self.adam_update(dW, db, current_lr, beta1, beta2)
-                else:  # SGD
+                else: 
                     for i in range(self.n_layers):
                         self.weights[i] -= current_lr * dW[i]
                         self.biases[i] -= current_lr * db[i]
             
-            # Calcular loss promedio de la época
             avg_train_loss = epoch_loss / len(mini_batches)
             history['train_loss'].append(float(avg_train_loss))
 
-            # Validación
             if X_val is not None and y_val is not None:
                 if is_numpy:
                     val_loss = self._compute_validation_loss_batched(X_val, y_val, lambda_reg)
@@ -288,20 +283,17 @@ class MLP:
                 
                 history['val_loss'].append(float(val_loss))
                 
-                # Guardar mejor modelo
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_weights = [w.copy() for w in self.weights]
                     best_biases = [b.copy() for b in self.biases]
                 
-                # Early stopping
                 if early_stopper is not None:
                     early_stopper(val_loss)
                     if early_stopper.early_stop:
                         if verbose:
                             print(f"\nEarly stopping triggered at epoch {epoch}")
                             print(f"Restoring best weights from epoch {epoch - early_stopper.patience}")
-                        # Restaurar mejor modelo
                         self.weights = best_weights
                         self.biases = best_biases
                         break
@@ -314,13 +306,33 @@ class MLP:
                     print(f"Epoch {epoch}/{epochs} - LR: {current_lr:.6f} - "
                         f"Train Loss: {avg_train_loss:.4f}")
         
-        # Al final del entrenamiento, restaurar el mejor modelo si hubo validación
         if X_val is not None and best_weights is not None:
             self.weights = best_weights
             self.biases = best_biases
             if verbose:
                 print(f"\nTraining completed. Best validation loss: {best_val_loss:.4f}")
-        
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        epochs_trained = len(history['train_loss'])
+        time_per_epoch = total_time / epochs_trained if epochs_trained > 0 else 0
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print("TRAINING TIME SUMMARY")
+            print(f"{'='*60}")
+            print(f"Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
+            print(f"Epochs trained: {epochs_trained}")
+            print(f"Time per epoch: {time_per_epoch:.2f}s")
+            print(f"{'='*60}\n")
+
+        history['training_time'] = {
+            'total_seconds': total_time,
+            'total_minutes': total_time / 60,
+            'epochs_trained': epochs_trained,
+            'seconds_per_epoch': time_per_epoch
+        }
+
         return history
 
     def _compute_validation_loss_batched(self, X_val, y_val, lambda_reg=0):
@@ -351,7 +363,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
-        
+
     def __call__(self, val_loss):
         if self.best_loss is None:
             self.best_loss = val_loss
@@ -362,3 +374,243 @@ class EarlyStopping:
         else:
             self.best_loss = val_loss
             self.counter = 0
+
+
+class MLP_PyTorch(nn.Module):
+
+    def __init__(self, input_size, hidden_sizes, num_classes):
+        super(MLP_PyTorch, self).__init__()
+        layers = []
+        layer_sizes = [input_size] + hidden_sizes + [num_classes]
+
+        for i in range(len(layer_sizes) - 1):
+            layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
+            # Add ReLU activation for all layers except the last one
+            if i < len(layer_sizes) - 2:
+                layers.append(nn.ReLU())
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class MLP_PyTorch_Advanced(nn.Module):
+    def __init__(self, input_size, hidden_sizes, num_classes, activation='relu', dropout_rate=0.0):
+        super(MLP_PyTorch_Advanced, self).__init__()
+        layers = []
+        layer_sizes = [input_size] + hidden_sizes + [num_classes]
+
+        activation_dict = {
+            'relu': nn.ReLU(),
+            'leakyrelu': nn.LeakyReLU(),
+            'gelu': nn.GELU(),
+            'silu': nn.SiLU(),
+            'swish': nn.SiLU()
+        }
+
+        act_fn = activation_dict.get(activation.lower(), nn.ReLU())
+
+        for i in range(len(layer_sizes) - 1):
+            layers.append(nn.Linear(layer_sizes[i], layer_sizes[i+1]))
+            if i < len(layer_sizes) - 2:
+                layers.append(act_fn)
+                if dropout_rate > 0:
+                    layers.append(nn.Dropout(dropout_rate))
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class PyTorchTrainer:
+
+    def __init__(self, model, device='cuda'):
+
+        self.model = model
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+
+    def prepare_data(self, X_train, y_train, X_val, y_val, batch_size=128):
+
+        X_train_torch = torch.tensor(X_train.astype(np.float32)).to(self.device)
+        y_train_torch = torch.tensor(y_train.astype(np.int64)).to(self.device)
+
+        X_val_torch = torch.tensor(X_val.astype(np.float32)).to(self.device)
+        y_val_torch = torch.tensor(y_val.astype(np.int64)).to(self.device)
+
+        train_dataset = TensorDataset(X_train_torch, y_train_torch)
+        val_dataset = TensorDataset(X_val_torch, y_val_torch)
+
+        train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(dataset=val_dataset, batch_size=batch_size, shuffle=False)
+
+        return train_loader, val_loader
+
+    def train_epoch(self, train_loader, criterion, optimizer):
+        self.model.train()
+        running_loss = 0.0
+        correct_predictions = 0
+        total_samples = 0
+
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+            optimizer.zero_grad()
+            outputs = self.model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs.data, 1)
+            total_samples += labels.size(0)
+            correct_predictions += (predicted == labels).sum().item()
+
+        epoch_loss = running_loss / total_samples
+        epoch_acc = correct_predictions / total_samples
+        return epoch_loss, epoch_acc
+
+    def evaluate(self, data_loader, criterion):
+        """Evaluate model on given data loader."""
+        self.model.eval()
+        running_loss = 0.0
+        correct_predictions = 0
+        total_samples = 0
+        all_preds = []
+        all_labels = []
+
+        with torch.no_grad():
+            for inputs, labels in data_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
+                outputs = self.model(inputs)
+                loss = criterion(outputs, labels)
+
+                running_loss += loss.item() * inputs.size(0)
+                _, predicted = torch.max(outputs.data, 1)
+                total_samples += labels.size(0)
+                correct_predictions += (predicted == labels).sum().item()
+
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+
+        epoch_loss = running_loss / total_samples
+        epoch_acc = correct_predictions / total_samples
+        return epoch_loss, epoch_acc, np.array(all_labels), np.array(all_preds)
+
+    def train(self, train_loader, val_loader, epochs=50, learning_rate=0.001,
+              weight_decay=0.001, lr_schedule=None, lr_schedule_params=None,
+              early_stopping_patience=None, verbose=True):
+
+        start_time = time.time()
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+        # Setup learning rate scheduler
+        scheduler = None
+        if lr_schedule == 'exponential' and lr_schedule_params:
+            decay_rate = lr_schedule_params.get('decay_rate', 0.95)
+            scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+
+        # Setup early stopping
+        early_stopper = None
+        if early_stopping_patience is not None:
+            early_stopper = EarlyStopping(patience=early_stopping_patience)
+
+        history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+            'learning_rates': []
+        }
+
+        best_val_loss = float('inf')
+        best_model_state = None
+
+        for epoch in range(epochs):
+            current_lr = optimizer.param_groups[0]['lr']
+            history['learning_rates'].append(current_lr)
+
+            # Train
+            train_loss, train_acc = self.train_epoch(train_loader, criterion, optimizer)
+
+            # Validate
+            val_loss, val_acc, _, _ = self.evaluate(val_loader, criterion)
+
+            # Record history
+            history['train_loss'].append(train_loss)
+            history['train_acc'].append(train_acc)
+            history['val_loss'].append(val_loss)
+            history['val_acc'].append(val_acc)
+
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+
+            # Early stopping check
+            if early_stopper is not None:
+                early_stopper(val_loss)
+                if early_stopper.early_stop:
+                    if verbose:
+                        print(f"\nEarly stopping triggered at epoch {epoch}")
+                        print(f"Restoring best weights from epoch {epoch - early_stopper.patience}")
+                    self.model.load_state_dict(best_model_state)
+                    break
+
+            # Step scheduler
+            if scheduler is not None:
+                scheduler.step()
+
+            if verbose and (epoch % 10 == 0 or epoch == 0):
+                print(f"Epoch [{epoch+1}/{epochs}], LR: {current_lr:.6f}, "
+                      f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
+                      f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+        # Load best model
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            if verbose:
+                print(f"\nTraining completed. Best validation loss: {best_val_loss:.4f}")
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        epochs_trained = len(history['train_loss'])
+        time_per_epoch = total_time / epochs_trained if epochs_trained > 0 else 0
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print("TRAINING TIME SUMMARY")
+            print(f"{'='*60}")
+            if total_time >= 60:
+                mins = int(total_time // 60)
+                secs = int(total_time % 60)
+                print(f"Total time: {mins}min {secs}s ({total_time:.2f}s)")
+            else:
+                print(f"Total time: {total_time:.2f}s")
+            print(f"Epochs trained: {epochs_trained}")
+            print(f"Time per epoch: {time_per_epoch:.2f}s")
+            print(f"{'='*60}\n")
+
+        history['training_time'] = {
+            'total_seconds': total_time,
+            'total_minutes': total_time / 60,
+            'epochs_trained': epochs_trained,
+            'seconds_per_epoch': time_per_epoch
+        }
+
+        return history
+
+    def predict(self, X):
+        self.model.eval()
+        X_torch = torch.tensor(X.astype(np.float32)).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(X_torch)
+            _, predicted = torch.max(outputs.data, 1)
+
+        return predicted.cpu().numpy()

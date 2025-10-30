@@ -434,11 +434,10 @@ class PyTorchTrainer:
 
     def prepare_data(self, X_train, y_train, X_val, y_val, batch_size=128):
 
-        X_train_torch = torch.tensor(X_train.astype(np.float32)).to(self.device)
-        y_train_torch = torch.tensor(y_train.astype(np.int64)).to(self.device)
-
-        X_val_torch = torch.tensor(X_val.astype(np.float32)).to(self.device)
-        y_val_torch = torch.tensor(y_val.astype(np.int64)).to(self.device)
+        X_train_torch = torch.tensor(X_train.astype(np.float32))
+        y_train_torch = torch.tensor(y_train.astype(np.int64))
+        X_val_torch = torch.tensor(X_val.astype(np.float32))
+        y_val_torch = torch.tensor(y_val.astype(np.int64))
 
         train_dataset = TensorDataset(X_train_torch, y_train_torch)
         val_dataset = TensorDataset(X_val_torch, y_val_torch)
@@ -605,12 +604,20 @@ class PyTorchTrainer:
 
         return history
 
-    def predict(self, X):
+    def predict(self, X, batch_size=128):
         self.model.eval()
-        X_torch = torch.tensor(X.astype(np.float32)).to(self.device)
-
+        
+        # Crear un DataLoader para procesar por batches
+        X_torch = torch.tensor(X.astype(np.float32))
+        dataset = TensorDataset(X_torch)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        
+        predictions = []
         with torch.no_grad():
-            outputs = self.model(X_torch)
-            _, predicted = torch.max(outputs.data, 1)
-
-        return predicted.cpu().numpy()
+            for batch_X in loader:
+                batch_X = batch_X[0].to(self.device)  # Mover el batch a GPU
+                outputs = self.model(batch_X)
+                _, predicted = torch.max(outputs.data, 1)
+                predictions.extend(predicted.cpu().numpy())
+        
+        return np.array(predictions)
